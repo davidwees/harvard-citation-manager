@@ -1,54 +1,18 @@
-import sqlite3
 import re
 import hashlib
 import streamlit as st
 import pandas as pd
+from supabase import create_client, Client
 
-# Database Setup
-DB_FILE = "citations.db"
+# Initialize Supabase Client
+@st.cache_resource
+def init_supabase() -> Client:
+    # Fetch credentials from Streamlit Secrets or environment
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
 
-def get_connection():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS folders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (id)
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS citations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                folder_id INTEGER,
-                raw_text TEXT NOT NULL,
-                authors TEXT,
-                year TEXT,
-                title TEXT,
-                source TEXT,
-                url TEXT,
-                notes TEXT DEFAULT '',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (id),
-                FOREIGN KEY (folder_id) REFERENCES folders (id) ON DELETE SET NULL
-            )
-        """)
-        conn.commit()
+supabase = init_supabase()
 
 # Helper Functions: Auth
 def hash_password(password):
@@ -56,39 +20,31 @@ def hash_password(password):
 
 def register_user(username, password):
     try:
-        with get_connection() as conn:
-            conn.execute(
-                "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-                (username, hash_password(password))
-            )
-            conn.commit()
-            return True
-    except sqlite3.IntegrityError:
+        response = supabase.table("users").insert({
+            "username": username,
+            "password_hash": hash_password(password)
+        }).execute()
+        return True if response.data else False
+    except Exception:
         return False
 
 def authenticate_user(username, password):
-    with get_connection() as conn:
-        return conn.execute(
-            "SELECT * FROM users WHERE username = ? AND password_hash = ?",
-            (username, hash_password(password))
-        ).fetchone()
+    response = supabase.table("users") \
+        .select("*") \
+        .eq("username", username) \
+        .eq("password_hash", hash_password(password)) \
+        .execute()
+    return response.data[0] if response.data else None
 
 # Helper Functions: Citation Parsing & Sorting
 def parse_harvard_citation(text):
-    """
-    Regex parser for basic Harvard format patterns.
-    Pattern target: Authors (Year) Title. Source. Available at: URL
-    """
     clean_text = text.strip()
     
-    # Extract URL if present
     url_match = re.search(r'Available at:\s*(https?://[^\s]+)', clean_text, re.IGNORECASE)
     url = url_match.group(1).rstrip('.') if url_match else ""
     
-    # Remove URL part for further parsing
     main_text = re.sub(r'Available at:\s*https?://[^\s]+', '', clean_text, flags=re.IGNORECASE).strip()
 
-    # Extract Authors and Year: Author(s) (Year or 'no date')
     author_year_match = re.match(r'^(.*?)\s*\((.*?)\)(.*)$', main_text)
     
     if author_year_match:
@@ -96,7 +52,6 @@ def parse_harvard_citation(text):
         year = author_year_match.group(2).strip()
         rest = author_year_match.group(3).strip()
         
-        # Split rest into Title and Source by first major punctuation
         parts = re.split(r'(?<=[.?!])\s+', rest, maxsplit=1)
         title = parts[0].strip() if len(parts) > 0 else rest
         source = parts[1].strip() if len(parts) > 1 else ""
@@ -116,95 +71,85 @@ def parse_harvard_citation(text):
     }
 
 def get_first_author_surname(authors_str):
-    """
-    Extracts the first author's surname for sorting purposes.
-    Handles formats like 'Siddiqui & Wardle', 'Siddiqui, A. and Wardle, B.', or 'BERA'.
-    """
     if not authors_str or not authors_str.strip():
-        return "ZZZ_UNKNOWN"  # Push empty authors to the end
+        return "ZZZ_UNKNOWN"
     
-    # Get the first author before connectors like '&', 'and', or commas separating multiple authors
     first_author = re.split(r'\s+and\s+|\s*&\s*|;', authors_str, flags=re.IGNORECASE)[0].strip()
     
     if ',' in first_author:
-        # Format: Surname, Initial(s)
         surname = first_author.split(',')[0].strip()
     else:
-        # Format: Firstname Surname or single word organization name
         words = [w for w in first_author.split() if not w.endswith('.')]
         surname = words[-1] if words else first_author
         
     return surname.lower()
 
-# Folder CRUD
+# Database Operations (Folders)
 def create_folder(user_id, folder_name):
-    with get_connection() as conn:
-        conn.execute("INSERT INTO folders (user_id, name) VALUES (?, ?)", (user_id, folder_name.strip()))
-        conn.commit()
+    supabase.table("folders").insert({
+        "user_id": user_id,
+        "name": folder_name.strip()
+    }).execute()
 
 def get_user_folders(user_id):
-    with get_connection() as conn:
-        return conn.execute("SELECT * FROM folders WHERE user_id = ? ORDER BY name ASC", (user_id,)).fetchall()
+    response = supabase.table("folders") \
+        .select("*") \
+        .eq("user_id", user_id) \
+        .order("name") \
+        .execute()
+    return response.data or []
 
 def delete_folder(folder_id):
-    with get_connection() as conn:
-        conn.execute("DELETE FROM folders WHERE id = ?", (folder_id,))
-        conn.commit()
+    supabase.table("folders").delete().eq("id", folder_id).execute()
 
-# Citation CRUD Operations
+# Database Operations (Citations)
 def save_citation(user_id, parsed_data, folder_id=None, notes=""):
-    with get_connection() as conn:
-        conn.execute("""
-            INSERT INTO citations (user_id, folder_id, raw_text, authors, year, title, source, url, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            user_id,
-            folder_id,
-            parsed_data["raw_text"],
-            parsed_data["authors"],
-            parsed_data["year"],
-            parsed_data["title"],
-            parsed_data["source"],
-            parsed_data["url"],
-            notes
-        ))
-        conn.commit()
+    payload = {
+        "user_id": user_id,
+        "folder_id": folder_id,
+        "raw_text": parsed_data["raw_text"],
+        "authors": parsed_data["authors"],
+        "year": parsed_data["year"],
+        "title": parsed_data["title"],
+        "source": parsed_data["source"],
+        "url": parsed_data["url"],
+        "notes": notes
+    }
+    supabase.table("citations").insert(payload).execute()
 
 def get_user_citations(user_id, folder_id=None):
-    with get_connection() as conn:
-        if folder_id is not None:
-            return conn.execute(
-                "SELECT c.*, f.name as folder_name FROM citations c LEFT JOIN folders f ON c.folder_id = f.id WHERE c.user_id = ? AND c.folder_id = ? ORDER BY c.id ASC",
-                (user_id, folder_id)
-            ).fetchall()
-        else:
-            return conn.execute(
-                "SELECT c.*, f.name as folder_name FROM citations c LEFT JOIN folders f ON c.folder_id = f.id WHERE c.user_id = ? ORDER BY c.id ASC",
-                (user_id,)
-            ).fetchall()
+    query = supabase.table("citations").select("*, folders(name)")
+    query = query.eq("user_id", user_id)
+    
+    if folder_id is not None:
+        query = query.eq("folder_id", folder_id)
+        
+    response = query.order("id").execute()
+    
+    # Flatten joined folder name for consistency
+    results = []
+    for row in response.data or []:
+        row["folder_name"] = row["folders"]["name"] if row.get("folders") else None
+        results.append(row)
+    return results
 
 def update_citation_folder_and_notes(citation_id, folder_id, notes):
-    with get_connection() as conn:
-        conn.execute(
-            "UPDATE citations SET folder_id = ?, notes = ? WHERE id = ?",
-            (folder_id, notes, citation_id)
-        )
-        conn.commit()
+    supabase.table("citations").update({
+        "folder_id": folder_id,
+        "notes": notes
+    }).eq("id", citation_id).execute()
 
 def delete_citation(citation_id):
-    with get_connection() as conn:
-        conn.execute("DELETE FROM citations WHERE id = ?", (citation_id,))
-        conn.commit()
+    supabase.table("citations").delete().eq("id", citation_id).execute()
 
 
 # App Interface
 st.set_page_config(page_title="Harvard Citation Manager", page_icon="📚", layout="wide")
-init_db()
 
 if "user" not in st.session_state:
     st.session_state.user = None
 
-# Sidebar Authentication & Folder Management
+# Sidebar Authentication
 st.sidebar.title("👤 User Account")
 
 if st.session_state.user is None:
@@ -216,16 +161,16 @@ if st.session_state.user is None:
         if st.sidebar.button("Register"):
             if username and password:
                 if register_user(username, password):
-                    st.sidebar.success("Account created successfully! Please log in.")
+                    st.sidebar.success("Account created! Please log in.")
                 else:
-                    st.sidebar.error("Username already exists.")
+                    st.sidebar.error("Username already exists or error occurred.")
             else:
                 st.sidebar.warning("Please fill in both fields.")
     else:
         if st.sidebar.button("Login"):
             user = authenticate_user(username, password)
             if user:
-                st.session_state.user = dict(user)
+                st.session_state.user = user
                 st.rerun()
             else:
                 st.sidebar.error("Invalid username or password.")
@@ -239,7 +184,6 @@ else:
     st.sidebar.divider()
     st.sidebar.title("📁 Folders")
     
-    # Folder creation in sidebar
     new_folder_name = st.sidebar.text_input("New Folder Name", key="new_folder_input")
     if st.sidebar.button("Create Folder"):
         if new_folder_name.strip():
@@ -261,10 +205,10 @@ else:
     if selected_folder_id is not None:
         if st.sidebar.button("Delete Current Folder", type="secondary"):
             delete_folder(selected_folder_id)
-            st.sidebar.warning("Folder deleted (citations moved to Unassigned).")
+            st.sidebar.warning("Folder deleted.")
             st.rerun()
 
-# Main Application Content
+# Main Application
 st.title("📚 Harvard Citation Manager")
 
 if st.session_state.user is None:
@@ -273,7 +217,6 @@ else:
     user_id = st.session_state.user["id"]
     user_folders = get_user_folders(user_id)
 
-    # Tab Layout
     tab_add, tab_view, tab_export = st.tabs(["➕ Add Citation", "📋 Manage Citations & Notes", "📤 Export"])
 
     # --- TAB 1: ADD CITATION ---
@@ -300,29 +243,24 @@ else:
             if citation_input.strip():
                 parsed = parse_harvard_citation(citation_input)
                 save_citation(user_id, parsed, chosen_folder_id, initial_note)
-                st.success("Citation added successfully!")
+                st.success("Citation saved to Supabase!")
                 st.rerun()
             else:
                 st.warning("Please paste a citation before saving.")
 
     # --- TAB 2: MANAGE CITATIONS & NOTES ---
     with tab_view:
-        view_title = f"Citations ({selected_folder_label})"
-        st.subheader(view_title)
-        
+        st.subheader(f"Citations ({selected_folder_label})")
         records = get_user_citations(user_id, selected_folder_id)
 
         if not records:
-            st.info("No citations found for this folder view.")
+            st.info("No citations found.")
         else:
-            # Convert SQLite rows to dicts for sorting
-            records_list = [dict(r) for r in records]
-            
             sort_by_author = st.checkbox("Sort display by First Author Surname (A-Z)", value=True)
             if sort_by_author:
-                records_list.sort(key=lambda x: get_first_author_surname(x["authors"]))
+                records.sort(key=lambda x: get_first_author_surname(x["authors"]))
 
-            for row in records_list:
+            for row in records:
                 folder_tag = f" [{row['folder_name']}]" if row.get("folder_name") else " [Unassigned]"
                 with st.expander(f"📌 #{row['id']} - {row['authors'] or 'Unknown Author'} ({row['year'] or 'n.d.'}){folder_tag}"):
                     col1, col2 = st.columns([3, 1])
@@ -343,7 +281,6 @@ else:
 
                     st.divider()
                     
-                    # Folder and Note editing block
                     folder_choices = {"Unassigned": None}
                     for f in user_folders:
                         folder_choices[f["name"]] = f["id"]
@@ -375,7 +312,7 @@ else:
                     if new_note != current_note or updated_folder_id != current_folder_id:
                         if st.button("Update Record", key=f"save_note_{row['id']}"):
                             update_citation_folder_and_notes(row["id"], updated_folder_id, new_note)
-                            st.success("Record updated successfully!")
+                            st.success("Record updated!")
                             st.rerun()
 
     # --- TAB 3: EXPORT ---
@@ -384,10 +321,8 @@ else:
         records = get_user_citations(user_id, selected_folder_id)
 
         if not records:
-            st.info("No citations available to export for this selection.")
+            st.info("No citations available to export.")
         else:
-            records_list = [dict(r) for r in records]
-
             col_exp1, col_exp2 = st.columns(2)
             with col_exp1:
                 export_format = st.radio("Select Output Format:", ["Raw Text List", "Include Notes", "CSV Table"])
@@ -395,18 +330,21 @@ else:
                 sort_alphabetical = st.checkbox("Alphabetize by First Author Surname (A-Z)", value=True)
 
             if sort_alphabetical:
-                records_list.sort(key=lambda x: get_first_author_surname(x["authors"]))
+                records.sort(key=lambda x: get_first_author_surname(x["authors"]))
 
             formatted_output = ""
             if export_format == "Raw Text List":
-                formatted_output = "\n\n".join([r["raw_text"] for r in records_list])
+                formatted_output = "\n\n".join([r["raw_text"] for r in records])
             elif export_format == "Include Notes":
                 formatted_output = "\n\n".join([
                     f"{r['raw_text']}\nNote: {r['notes']}" if r['notes'] else r['raw_text']
-                    for r in records_list
+                    for r in records
                 ])
             elif export_format == "CSV Table":
-                df = pd.DataFrame(records_list)
+                df = pd.DataFrame(records)
+                # Drop raw internal object column from CSV output if present
+                if "folders" in df.columns:
+                    df = df.drop(columns=["folders"])
                 formatted_output = df.to_csv(index=False)
 
             st.text_area("Ready to Copy:", value=formatted_output, height=300)
